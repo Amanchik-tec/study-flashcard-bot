@@ -275,8 +275,8 @@ def load_random_quizzes(count: int = REVIEW_COUNT, path: Path = CARDS_PATH) -> l
 
 async def main() -> None:
     proxy_url = os.getenv("PROXY_URL", "").strip()
-session = AiohttpSession(proxy=proxy_url) if proxy_url else None
-bot = Bot(token=get_bot_token(), session=session)   
+    session = AiohttpSession(proxy=proxy_url) if proxy_url else None
+    bot = Bot(token=get_bot_token(), session=session)
     client = genai.Client(api_key=get_gemini_api_key())
     dp = Dispatcher()
 
