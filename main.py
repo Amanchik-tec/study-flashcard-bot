@@ -2,11 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import random
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
 from google import genai
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 MODEL = "gemini-3.5-flash"
 CARD_COUNT = 20
 QUIZ_COUNT = 20
+REVIEW_COUNT = 10
 MESSAGE_LIMIT = 4000
 POLL_QUESTION_LIMIT = 300
 POLL_OPTION_LIMIT = 100
@@ -92,7 +95,7 @@ def build_prompt(source: str) -> str:
         f"Карточек должно быть ровно {CARD_COUNT}.\n"
         f"Вопросов викторины должно быть ровно {QUIZ_COUNT}.\n"
         "Язык вопроса и ответа совпадает с языком материала.\n"
-        "Если прислана тема, раскрой её базовыми фактами. Если конспект — опирайся на него.\n"
+        "Если прислана тема, раскрой её базовыми фактами. Если конспект или фото — опирайся на них.\n"
         "Вопросы конкретные, ответы короткие.\n"
         "У каждого вопроса викторины ровно 4 разных варианта, и только один из них верный.\n"
         f"quiz_question — не длиннее {POLL_QUESTION_LIMIT} символов.\n"
@@ -141,16 +144,28 @@ def normalize_pack(pack: StudyPack) -> StudyPack:
     return StudyPack(cards=cards, quizzes=normalized_quizzes)
 
 
-async def generate_pack(client: genai.Client, source: str) -> StudyPack:
+async def generate_pack(
+    client: genai.Client,
+    source: str,
+    image_bytes: bytes | None = None,
+    mime_type: str = "image/jpeg",
+) -> StudyPack:
+    contents: list[object] = [build_prompt(source)]
+    if image_bytes:
+        contents.append(
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        )
+
     response = await client.aio.models.generate_content(
         model=MODEL,
-        contents=build_prompt(source),
+        contents=contents,
         config=types.GenerateContentConfig(
             temperature=0.4,
             response_mime_type="application/json",
             response_schema=StudyPack,
             system_instruction=(
                 f"Ты составляешь {CARD_COUNT} карточек для запоминания и {QUIZ_COUNT} вопросов викторины. "
+                "Если приложено изображение (конспект, страница учебника, схема), внимательно изучи его и составь карточки по материалу на фото. "
                 "Верни только JSON по заданной схеме."
             ),
         ),
@@ -233,6 +248,30 @@ def append_study_pack(topic: str, pack: StudyPack, path: Path = CARDS_PATH) -> N
     temporary.replace(path)
 
 
+def load_random_quizzes(count: int = REVIEW_COUNT, path: Path = CARDS_PATH) -> list[tuple[str, QuizItem]]:
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        return []
+
+    pool: list[tuple[str, QuizItem]] = []
+    for entry in data:
+        topic = entry.get("topic", "Без темы")
+        for q in entry.get("quizzes", []):
+            try:
+                pool.append((topic, QuizItem.model_validate(q)))
+            except Exception:
+                continue
+
+    if not pool:
+        return []
+    return random.sample(pool, k=min(count, len(pool)))
+
+
 async def main() -> None:
     bot = Bot(token=get_bot_token())
     client = genai.Client(api_key=get_gemini_api_key())
@@ -242,32 +281,72 @@ async def main() -> None:
     async def cmd_start(message: Message) -> None:
         name = message.from_user.full_name if message.from_user else "друг"
         await message.answer(
-            f"Привет, {name}! Пришли мне тему или конспект лекции для составления карточек и вопросов викторины — "
-            f"я пришлю {CARD_COUNT} карточек и {QUIZ_COUNT} вопросов викторины для каждого из них."
+            f"Привет, {name}! Пришли тему, конспект или фото страницы учебника — "
+            f"я пришлю {CARD_COUNT} карточек и {QUIZ_COUNT} вопросов викторины.\n\n"
+            f"Чтобы повторить пройденные темы, отправь команду /review."
         )
 
-    @dp.message(F.text, ~F.text.startswith("/"))
-    async def make_cards(message: Message) -> None:
-        source = (message.text or "").strip()
-        if not source:
+    @dp.message(Command("review"))
+    async def cmd_review(message: Message) -> None:
+        async with _cards_lock:
+            selected = await asyncio.to_thread(load_random_quizzes, REVIEW_COUNT)
+
+        if not selected:
+            await message.answer(
+                "База повторений пока пуста. Сначала отправь мне любую тему или фото, чтобы я создал карточки!"
+            )
             return
 
+        await message.answer(f"Начинаем повторение! Случайных вопросов из твоей базы: {len(selected)}")
+        for topic, quiz in selected:
+            question_with_topic = fit_text(f"[{topic}] {quiz.quiz_question}", POLL_QUESTION_LIMIT)
+            await message.answer_poll(
+                question=question_with_topic,
+                options=quiz.options,
+                type="quiz",
+                correct_option_id=quiz.correct_option_id,
+                explanation=quiz.explanation or None,
+                is_anonymous=False,
+            )
+            await asyncio.sleep(0.5)
+
+    @dp.message(F.photo | (F.text & ~F.text.startswith("/")))
+    async def make_cards(message: Message) -> None:
+        image_bytes: bytes | None = None
+        if message.photo and message.bot:
+            largest_photo = message.photo[-1]
+            buffer = BytesIO()
+            await message.bot.download(largest_photo, destination=buffer)
+            image_bytes = buffer.getvalue()
+            caption = (message.caption or "").strip()
+            source = caption if caption else "Изучи материал на прикреплённом изображении"
+            topic_label = (
+                f"[Фото] {caption}"
+                if caption
+                else f"[Фото] {datetime.now().strftime('%d.%m %H:%M')}"
+            )
+        else:
+            source = (message.text or "").strip()
+            if not source:
+                return
+            topic_label = source
+
         status = await message.answer(
-            f"Составляю {CARD_COUNT} карточек и {QUIZ_COUNT} вопросов викторины…"
+            f"Изучаю материал и составляю {CARD_COUNT} карточек и {QUIZ_COUNT} вопросов викторины…"
         )
         try:
-            pack = await generate_pack(client, source)
+            pack = await generate_pack(client, source, image_bytes=image_bytes)
         except Exception:
             logger.exception("Не удалось получить карточки от Gemini")
             await status.edit_text(
-                "Не получилось составить карточки. Проверьте ключ Gemini и попробуйте ещё раз."
+                "Не получилось обработать материал. Проверьте ключ Gemini или качество фото и попробуйте ещё раз."
             )
             return
 
         saved = True
         try:
             async with _cards_lock:
-                await asyncio.to_thread(append_study_pack, source, pack)
+                await asyncio.to_thread(append_study_pack, topic_label, pack)
         except Exception:
             saved = False
             logger.exception("Не удалось записать cards.json")
