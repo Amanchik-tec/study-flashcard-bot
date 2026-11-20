@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
@@ -273,7 +274,9 @@ def load_random_quizzes(count: int = REVIEW_COUNT, path: Path = CARDS_PATH) -> l
 
 
 async def main() -> None:
-    bot = Bot(token=get_bot_token())
+    proxy_url = os.getenv("PROXY_URL", "").strip()
+session = AiohttpSession(proxy=proxy_url) if proxy_url else None
+bot = Bot(token=get_bot_token(), session=session)   
     client = genai.Client(api_key=get_gemini_api_key())
     dp = Dispatcher()
 
